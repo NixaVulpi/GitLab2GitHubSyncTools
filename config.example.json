@@ -1,0 +1,8 @@
+{
+  "gitlab_url": "https://gitlab.example.com/",
+  "gitlab_token": "YOUR_GITLAB_TOKEN",
+  "github_token": "YOUR_GITHUB_TOKEN",
+  "github_owner": "YOUR_GITHUB_ORG_OR_USER",
+  "github_owner_type": "org",
+  "jobs": 3
+}

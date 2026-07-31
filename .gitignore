@@ -1,0 +1,11 @@
+config.json
+*.local.json
+
+.gitlab-mirror-cache/
+.gitlab-migration-failures.json
+.migration-tools/
+__pycache__/
+
+gitlab_projects.json
+gitlab_projects.csv
+gitlab_clone_urls.txt
