@@ -1275,6 +1275,11 @@ def main():
     )
     if not args.quiet_output:
         print(f"Recorded failures remaining: {len(failure_records)}")
+    elif counts["failed"]:
+        first_failure = next(iter(failure_records.values()), {})
+        first_error = first_failure.get("error") or "unknown error"
+        print(f"First failure: {first_error}")
+        print(f"Failure record: {failed_record_path}")
 
     return 1 if counts["failed"] else 0
 
