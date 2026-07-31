@@ -1,5 +1,6 @@
 param(
     [string]$ConfigPath = "",
+    [int]$Limit = 0,
     [switch]$OnlyFailed,
     [switch]$QuietOutput
 )
@@ -40,6 +41,9 @@ function Get-SyncConfig {
     }
     if (-not $config.PSObject.Properties.Name.Contains("jobs") -or $null -eq $config.jobs) {
         $config | Add-Member -Force -NotePropertyName "jobs" -NotePropertyValue 3
+    }
+    if (-not $config.PSObject.Properties.Name.Contains("limit") -or $null -eq $config.limit) {
+        $config | Add-Member -Force -NotePropertyName "limit" -NotePropertyValue 0
     }
 
     return $config
@@ -197,6 +201,11 @@ try {
 
         if ($OnlyFailed) {
             $migrateArgs += "--only-failed"
+        }
+
+        $effectiveLimit = if ($Limit -gt 0) { $Limit } else { [int]$config.limit }
+        if ($effectiveLimit -gt 0) {
+            $migrateArgs += @("--limit", "$effectiveLimit")
         }
 
         if ($QuietOutput) {
