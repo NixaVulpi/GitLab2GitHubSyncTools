@@ -160,6 +160,7 @@ try {
     $env:GITLAB_URL = $config.gitlab_url
     $env:GITLAB_TOKEN = $config.gitlab_token
     $env:GITHUB_TOKEN = $config.github_token
+    $env:PYTHONUNBUFFERED = "1"
 
     $target = Resolve-GitHubTarget -Config $config
     if (-not $QuietOutput) {
@@ -186,6 +187,12 @@ try {
     }
 
     Invoke-Step -Title "Mirror GitLab repositories to GitHub private repositories" -Quiet:$QuietOutput -Action {
+        $effectiveLimit = if ($Limit -gt 0) { $Limit } else { [int]$config.limit }
+        $effectiveJobs = [int]$config.jobs
+        if ($effectiveLimit -eq 1) {
+            $effectiveJobs = 1
+        }
+
         $migrateArgs = @(
             $GitHubMigrateScript,
             "--input", $projectsJson,
@@ -196,14 +203,13 @@ try {
             "--failed-record-file", $failureRecord,
             "--strip-large-files",
             "--max-blob-size-mb", "100",
-            "--jobs", "$($config.jobs)"
+            "--jobs", "$effectiveJobs"
         )
 
         if ($OnlyFailed) {
             $migrateArgs += "--only-failed"
         }
 
-        $effectiveLimit = if ($Limit -gt 0) { $Limit } else { [int]$config.limit }
         if ($effectiveLimit -gt 0) {
             $migrateArgs += @("--limit", "$effectiveLimit")
         }
@@ -227,5 +233,6 @@ finally {
     Remove-Item Env:\GITLAB_URL -ErrorAction SilentlyContinue
     Remove-Item Env:\GITLAB_TOKEN -ErrorAction SilentlyContinue
     Remove-Item Env:\GITHUB_TOKEN -ErrorAction SilentlyContinue
+    Remove-Item Env:\PYTHONUNBUFFERED -ErrorAction SilentlyContinue
     Pop-Location
 }

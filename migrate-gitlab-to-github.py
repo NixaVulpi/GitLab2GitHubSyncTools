@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 from contextlib import contextmanager
+import ctypes
 import json
 import os
 import re
@@ -261,8 +262,8 @@ def update_failure_record(failures, project, target_name, cache_name, result, ex
             "source_url": project.get("ssh_url_to_repo"),
             "default_branch": project.get("default_branch"),
             "failed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "error": str(exc) if exc else "unknown error",
-            "log_tail": list(log[-80:]) if log else [],
+            "error": mask_sensitive_text(exc) if exc else "unknown error",
+            "log_tail": [mask_sensitive_text(line) for line in list(log[-80:])] if log else [],
         }
     else:
         failures.pop(key, None)
@@ -284,8 +285,21 @@ def is_retryable_git_command(cmd):
     return any(part in {"fetch", "push", "ls-remote"} for part in cmd[1:])
 
 
+def mask_sensitive_text(value):
+    text = str(value)
+    text = re.sub(r"https://x-access-token:[^@\s'\"]+@", "https://x-access-token:***@", text)
+    text = re.sub(r"github_pat_[A-Za-z0-9_]+", "github_pat_***", text)
+    text = re.sub(r"glpat-[A-Za-z0-9_-]+", "glpat-***", text)
+    return text
+
+
+def masked_command(cmd):
+    return [mask_sensitive_text(part) for part in cmd]
+
+
 def run(cmd, cwd=None, env=None, log=None, retries=0, retry_delay_seconds=10, input_text=None, display_cmd=None):
-    command_text = "+ " + " ".join(display_cmd or cmd)
+    safe_cmd = masked_command(display_cmd or cmd)
+    command_text = "+ " + " ".join(safe_cmd)
     emit(log, command_text)
 
     attempts = 1 + (retries if is_retryable_git_command(cmd) else 0)
@@ -293,9 +307,10 @@ def run(cmd, cwd=None, env=None, log=None, retries=0, retry_delay_seconds=10, in
         if log is None:
             result = subprocess.run(cmd, cwd=cwd, env=env, input=input_text, text=input_text is not None)
             if result.returncode == 0:
+                emit(log, "Command completed.")
                 return
             if attempt >= attempts:
-                raise subprocess.CalledProcessError(result.returncode, cmd)
+                raise subprocess.CalledProcessError(result.returncode, safe_cmd)
         else:
             result = subprocess.run(
                 cmd,
@@ -311,9 +326,10 @@ def run(cmd, cwd=None, env=None, log=None, retries=0, retry_delay_seconds=10, in
             if result.stdout:
                 log.extend(result.stdout.rstrip().splitlines())
             if result.returncode == 0:
+                emit(log, "Command completed.")
                 return
             if attempt >= attempts:
-                raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout)
+                raise subprocess.CalledProcessError(result.returncode, safe_cmd, output=mask_sensitive_text(result.stdout))
 
         emit(log, f"Command failed; retrying in {retry_delay_seconds}s ({attempt}/{attempts - 1})...")
         time.sleep(retry_delay_seconds)
@@ -342,14 +358,17 @@ def github_api(args, method, path, payload=None, log=None):
     attempts = 1 + retry_count(args)
     for attempt in range(1, attempts + 1):
         try:
+            emit(log, f"GitHub API {method} {path} attempt {attempt}/{attempts}...")
             with urlopen(request, timeout=60) as response:
                 data = response.read().decode("utf-8")
+                emit(log, f"GitHub API {method} {path} returned HTTP {response.status}.")
                 if not data:
                     return None
                 return json.loads(data)
         except HTTPError as exc:
             data = exc.read().decode("utf-8", errors="replace")
             if exc.code == 404:
+                emit(log, f"GitHub API {method} {path} returned HTTP 404.")
                 return None
             if exc.code not in {408, 429, 500, 502, 503, 504} or attempt >= attempts:
                 raise RuntimeError(f"GitHub API {method} {path} returned HTTP {exc.code}: {data}") from exc
@@ -507,7 +526,7 @@ def github_push_url(args, repo_name):
 
 
 def display_url(url):
-    return re.sub(r"https://x-access-token:[^@]+@", "https://x-access-token:***@", url)
+    return mask_sensitive_text(url)
 
 
 def clone_or_update_mirror(source_url, mirror_path, args, log=None):
@@ -900,6 +919,46 @@ def remove_file_if_exists(path):
         return False
 
 
+def process_exists(pid):
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    process_query_limited_information = 0x1000
+    handle = ctypes.windll.kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        return False
+    try:
+        exit_code = ctypes.c_ulong()
+        if not ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return False
+        still_active = 259
+        return exit_code.value == still_active
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
+
+
+def migration_lock_pid(lock_path):
+    try:
+        for line in lock_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            key, sep, value = line.partition("=")
+            if sep and key.strip() == "pid":
+                return value.strip()
+    except FileNotFoundError:
+        return None
+    return None
+
+
 def wait_for_internal_git_locks(mirror_path, args, log=None):
     deadline = time.monotonic() + max(0, args.git_lock_wait_seconds)
 
@@ -939,13 +998,21 @@ def repo_operation_lock(mirror_path, args, log=None):
 
     while not acquired:
         try:
+            emit(log, f"Acquiring migration lock: {lock_path}")
             fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(f"pid={os.getpid()}\n")
                 handle.write(f"mirror={mirror_path}\n")
                 handle.write(f"created={time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             acquired = True
+            emit(log, f"Acquired migration lock: {lock_path}")
         except FileExistsError:
+            lock_pid = migration_lock_pid(lock_path)
+            if lock_pid and not process_exists(lock_pid):
+                if remove_file_if_exists(lock_path):
+                    emit(log, f"Removed migration lock for exited pid {lock_pid}: {lock_path}")
+                continue
+
             age = file_age_seconds(lock_path)
             if age >= args.stale_repo_lock_seconds:
                 if remove_file_if_exists(lock_path):
@@ -963,6 +1030,7 @@ def repo_operation_lock(mirror_path, args, log=None):
         yield
     finally:
         remove_file_if_exists(lock_path)
+        emit(log, f"Released migration lock: {lock_path}")
 
 
 def large_blobs_in_mirror(mirror_path, max_size_bytes):
@@ -1151,12 +1219,16 @@ def migrate_worker(project, target_name, cache_name, args, mirror_root, log=None
         print_realtime(f"Starting repository: {project.get('path_with_namespace', target_name)}")
     try:
         mirror_path = mirror_root / safe_dir_name(project, cache_name)
+        emit(worker_log, f"Worker prepared cache path: {mirror_path}")
         with repo_operation_lock(mirror_path, args, log=worker_log):
+            emit(worker_log, "Checking GitHub repository state...")
             repo_info = None if args.dry_run else repo_exists(args, target_name, log=worker_log)
+            emit(worker_log, "Starting repository migration...")
             result = migrate_one(project, args, mirror_root, target_name, cache_name, repo_info, log=worker_log)
+            emit(worker_log, f"Repository migration finished: {result}")
         return result, worker_log or [], None, project, target_name
     except (RuntimeError, subprocess.CalledProcessError) as exc:
-        emit(worker_log, f"FAILED {project.get('path_with_namespace', target_name)}: {exc}")
+        emit(worker_log, f"FAILED {project.get('path_with_namespace', target_name)}: {mask_sensitive_text(exc)}")
         return "failed", worker_log or [], exc, project, target_name
 
 
@@ -1192,18 +1264,18 @@ def main():
         selected = selected[: args.limit]
 
     if not args.quiet_output:
-        print(f"Input: {input_path}")
-        print(f"Projects selected: {len(selected)}")
-        print(f"GitHub owner: {args.github_owner} ({args.owner_type})")
-        print(f"Mirror cache: {mirror_root}")
-        print(f"Failure record: {failed_record_path}")
+        print(f"Input: {input_path}", flush=True)
+        print(f"Projects selected: {len(selected)}", flush=True)
+        print(f"GitHub owner: {args.github_owner} ({args.owner_type})", flush=True)
+        print(f"Mirror cache: {mirror_root}", flush=True)
+        print(f"Failure record: {failed_record_path}", flush=True)
         if args.only_failed:
-            print(f"Only failed mode: {len(failure_records)} recorded failure(s)")
+            print(f"Only failed mode: {len(failure_records)} recorded failure(s)", flush=True)
     else:
-        print(f"Projects selected: {len(selected)}")
+        print(f"Projects selected: {len(selected)}", flush=True)
     jobs = max(1, args.jobs)
     if not args.quiet_output:
-        print(f"Parallel jobs: {jobs}")
+        print(f"Parallel jobs: {jobs}", flush=True)
 
     counts = {
         "migrated": 0,
@@ -1254,7 +1326,7 @@ def main():
                 if args.quiet_output:
                     print(f"Processed {completed}/{total}: {result}", flush=True)
                 else:
-                    print("\n".join(log))
+                    print("\n".join(log), flush=True)
                 counts[result] += 1
                 cache_name = next(
                     selected_cache_name
@@ -1264,22 +1336,31 @@ def main():
                 update_failure_record(failure_records, project, target_name, cache_name, result, exc, log)
                 save_failure_records(failed_record_path, failure_records)
 
-    print("")
+    print("", flush=True)
     print(
         "Done. "
         f"Migrated: {counts['migrated']}, "
         f"Default branch only: {counts['default-branch-only']}, "
         f"Skipped existing: {counts['skipped-existing']}, "
         f"Skipped large files: {counts['skipped-large-files']}, "
-        f"Failed: {counts['failed']}"
+        f"Failed: {counts['failed']}",
+        flush=True,
     )
     if not args.quiet_output:
-        print(f"Recorded failures remaining: {len(failure_records)}")
+        print(f"Recorded failures remaining: {len(failure_records)}", flush=True)
     elif counts["failed"]:
         first_failure = next(iter(failure_records.values()), {})
         first_error = first_failure.get("error") or "unknown error"
-        print(f"First failure: {first_error}")
-        print(f"Failure record: {failed_record_path}")
+        print(f"First failure: {first_error}", flush=True)
+        log_tail = first_failure.get("log_tail") or []
+        detail_lines = [
+            line
+            for line in log_tail
+            if any(marker in line.lower() for marker in ("remote:", "fatal:", "error:"))
+        ]
+        if detail_lines:
+            print(f"First failure detail: {mask_sensitive_text(detail_lines[-1])}", flush=True)
+        print(f"Failure record: {failed_record_path}", flush=True)
 
     return 1 if counts["failed"] else 0
 
