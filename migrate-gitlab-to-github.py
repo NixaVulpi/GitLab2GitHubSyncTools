@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 
@@ -383,6 +384,55 @@ def github_api(args, method, path, payload=None, log=None):
     raise RuntimeError(f"GitHub API {method} {path} failed after {attempts} attempts.")
 
 
+def gitlab_api(args, method, path, payload=None, log=None):
+    if not args.gitlab_token:
+        raise RuntimeError("Missing --gitlab-token or GITLAB_TOKEN.")
+
+    api_url = args.gitlab_url.rstrip("/")
+    if not api_url.endswith("/api/v4"):
+        api_url += "/api/v4"
+    url = api_url + path
+    body = None
+    headers = {
+        "PRIVATE-TOKEN": args.gitlab_token,
+        "Accept": "application/json",
+        "User-Agent": "gitlab-to-github-migration-script",
+    }
+
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    request = Request(url, data=body, headers=headers, method=method)
+
+    attempts = 1 + retry_count(args)
+    for attempt in range(1, attempts + 1):
+        try:
+            emit(log, f"GitLab API {method} {path} attempt {attempt}/{attempts}...")
+            with urlopen(request, timeout=60) as response:
+                data = response.read().decode("utf-8")
+                emit(log, f"GitLab API {method} {path} returned HTTP {response.status}.")
+                if not data:
+                    return None
+                return json.loads(data)
+        except HTTPError as exc:
+            data = exc.read().decode("utf-8", errors="replace")
+            if exc.code == 404:
+                emit(log, f"GitLab API {method} {path} returned HTTP 404.")
+                return None
+            if exc.code not in {408, 429, 500, 502, 503, 504} or attempt >= attempts:
+                raise RuntimeError(f"GitLab API {method} {path} returned HTTP {exc.code}: {data}") from exc
+            emit(log, f"GitLab API HTTP {exc.code}; retrying in {retry_delay(args)}s ({attempt}/{attempts - 1})...")
+            time.sleep(retry_delay(args))
+        except URLError as exc:
+            if attempt >= attempts:
+                raise RuntimeError(f"Cannot connect to GitLab API: {exc.reason}") from exc
+            emit(log, f"Cannot connect to GitLab API: {exc.reason}; retrying in {retry_delay(args)}s ({attempt}/{attempts - 1})...")
+            time.sleep(retry_delay(args))
+
+    raise RuntimeError(f"GitLab API {method} {path} failed after {attempts} attempts.")
+
+
 def repo_exists(args, repo_name, log=None):
     owner = quote(args.github_owner, safe="")
     repo = quote(repo_name, safe="")
@@ -393,6 +443,103 @@ def repo_is_empty(repo_info):
     if not repo_info:
         return False
     return int(repo_info.get("size") or 0) == 0 and not repo_info.get("pushed_at")
+
+
+def list_gitlab_refs(args, project_id, ref_kind, log=None):
+    refs = []
+    page = 1
+    while True:
+        path = f"/projects/{quote(str(project_id), safe='')}/repository/{ref_kind}?{urlencode({'page': page, 'per_page': 100})}"
+        batch = gitlab_api(args, "GET", path, log=log)
+        if not batch:
+            break
+        refs.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return refs
+
+
+def list_github_refs(args, owner, repo, ref_kind, log=None):
+    refs = []
+    page = 1
+    while True:
+        path = f"/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/{ref_kind}?{urlencode({'page': page, 'per_page': 100})}"
+        batch = github_api(args, "GET", path, log=log)
+        if not batch:
+            break
+        refs.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return refs
+
+
+def github_tag_commit_sha(args, owner, repo, tag_sha, log=None):
+    tag = github_api(args, "GET", f"/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/git/tags/{quote(tag_sha, safe='')}", log=log)
+    if not tag:
+        return tag_sha
+    obj = tag.get("object") or {}
+    return obj.get("sha") or tag_sha
+
+
+def remote_gitlab_ref_state(args, project, log=None):
+    project_id = project.get("id")
+    if project_id is None:
+        raise RuntimeError("GitLab project is missing id.")
+
+    state = {}
+    for branch in list_gitlab_refs(args, project_id, "branches", log=log):
+        name = branch.get("name")
+        sha = branch.get("commit", {}).get("id")
+        if name and sha:
+            state[f"refs/heads/{name}"] = sha
+    for tag in list_gitlab_refs(args, project_id, "tags", log=log):
+        name = tag.get("name")
+        sha = tag.get("commit", {}).get("id")
+        if name and sha:
+            state[f"refs/tags/{name}"] = sha
+    return state
+
+
+def remote_github_ref_state(args, repo_name, log=None):
+    owner = args.github_owner
+    state = {}
+    for branch in list_github_refs(args, owner, repo_name, "branches", log=log):
+        name = branch.get("name")
+        sha = (branch.get("commit") or {}).get("sha")
+        if name and sha:
+            state[f"refs/heads/{name}"] = sha
+    for ref in list_github_refs(args, owner, repo_name, "git/matching-refs/tags", log=log):
+        refname = ref.get("ref", "")
+        if not refname.startswith("refs/tags/"):
+            continue
+        name = refname[len("refs/tags/") :]
+        obj = ref.get("object") or {}
+        sha = obj.get("sha")
+        if obj.get("type") == "tag" and sha:
+            sha = github_tag_commit_sha(args, owner, repo_name, sha, log=log)
+        if name and sha:
+            state[f"refs/tags/{name}"] = sha
+    return state
+
+
+def local_cache_ref_state(mirror_path):
+    state = {}
+    for refname, object_id, _created in refs_in_namespaces(mirror_path, ["refs/heads", "refs/tags"]):
+        try:
+            peeled = git_capture(
+                ["git", "-C", str(mirror_path), "rev-parse", "--verify", f"{refname}^{{commit}}"]
+            ).strip()
+        except subprocess.CalledProcessError:
+            peeled = object_id
+        if peeled:
+            state[refname] = peeled
+    return state
+
+
+def states_match(left, right):
+    return left == right
 
 
 def create_private_repo(args, repo_name, description, log=None):
@@ -529,15 +676,16 @@ def display_url(url):
     return mask_sensitive_text(url)
 
 
-def clone_or_update_mirror(source_url, mirror_path, args, log=None):
+def clone_or_update_mirror(source_url, mirror_path, args, log=None, fetch=True):
     dry_run = args.dry_run
     if mirror_path.exists():
         if dry_run:
             emit(log, f"Would update existing mirror: {mirror_path}")
             return
         ensure_origin_remote(mirror_path, source_url, log=log)
-        normalize_existing_mirror_refs(mirror_path, log=log)
-        fetch_selected_refs(source_url, mirror_path, args, log=log)
+        if fetch:
+            normalize_existing_mirror_refs(mirror_path, log=log)
+            fetch_selected_refs(source_url, mirror_path, args, log=log)
         return
 
     if dry_run:
@@ -1171,12 +1319,24 @@ def migrate_one(project, args, mirror_root, target_name, cache_name, repo_info, 
 
     target_url = github_push_url(args, target_name)
     mirror_path = mirror_root / safe_dir_name(project, cache_name)
+    local_state = None
+    gitlab_state = None
+    github_state = None
+    fetch_needed = True
+    push_needed = True
 
     emit(log, "")
     emit(log, f"==> {project.get('path_with_namespace', target_name)}")
     emit(log, f"GitLab: {source_url}")
     emit(log, f"GitHub: {display_url(target_url)}")
     emit(log, f"Cache: {mirror_path}")
+
+    if mirror_path.exists() and not args.dry_run:
+        local_state = local_cache_ref_state(mirror_path)
+        gitlab_state = remote_gitlab_ref_state(args, project, log=log)
+        if states_match(local_state, gitlab_state):
+            fetch_needed = False
+            emit(log, "Local cache already matches GitLab refs; skipping GitLab fetch.")
 
     if repo_info:
         emit(log, "GitHub repository already exists.")
@@ -1188,7 +1348,9 @@ def migrate_one(project, args, mirror_root, target_name, cache_name, repo_info, 
         if args.dry_run:
             emit(log, f"Would create private GitHub repository: {args.github_owner}/{target_name}")
 
-    clone_or_update_mirror(source_url, mirror_path, args, log=log)
+    clone_or_update_mirror(source_url, mirror_path, args, log=log, fetch=fetch_needed)
+    if local_state is None or fetch_needed:
+        local_state = local_cache_ref_state(mirror_path)
     prepare_result = prepare_mirror_for_github(args, mirror_path, log=log)
     if prepare_result != "ok":
         return prepare_result
@@ -1199,6 +1361,16 @@ def migrate_one(project, args, mirror_root, target_name, cache_name, repo_info, 
         description = f"Migrated from GitLab project {project.get('path_with_namespace', '')}".strip()
         create_private_repo(args, target_name, description, log=log)
         emit(log, "Created private GitHub repository.")
+
+    if repo_info and not args.dry_run:
+        github_state = remote_github_ref_state(args, target_name, log=log)
+        if states_match(local_state, github_state):
+            push_needed = False
+            emit(log, "Local cache already matches GitHub refs; skipping GitHub push.")
+
+    if not push_needed and repo_info:
+        set_default_branch(args, target_name, project.get("default_branch"), args.dry_run, log=log)
+        return "skipped-unchanged"
 
     push_mirror(mirror_path, target_url, args, log=log)
     set_default_branch(args, target_name, project.get("default_branch"), args.dry_run, log=log)
@@ -1281,6 +1453,7 @@ def main():
         "migrated": 0,
         "default-branch-only": 0,
         "skipped-existing": 0,
+        "skipped-unchanged": 0,
         "skipped-large-files": 0,
         "failed": 0,
     }
@@ -1342,6 +1515,7 @@ def main():
         f"Migrated: {counts['migrated']}, "
         f"Default branch only: {counts['default-branch-only']}, "
         f"Skipped existing: {counts['skipped-existing']}, "
+        f"Skipped unchanged: {counts['skipped-unchanged']}, "
         f"Skipped large files: {counts['skipped-large-files']}, "
         f"Failed: {counts['failed']}",
         flush=True,
