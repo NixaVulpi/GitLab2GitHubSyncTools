@@ -557,16 +557,23 @@ def create_private_repo(args, repo_name, description, log=None):
     return github_api(args, "POST", "/user/repos", payload, log=log)
 
 
-def set_default_branch(args, repo_name, branch_name, dry_run, log=None):
+def set_default_branch(args, repo_name, branch_name, dry_run, current_branch=None, log=None):
     if not branch_name:
         emit(log, "No GitLab default_branch value; skipping GitHub default branch update.")
+        return
+
+    if current_branch and current_branch == branch_name:
+        emit(log, f"GitHub default branch already set to {branch_name}; skipping update.")
         return
 
     owner = quote(args.github_owner, safe="")
     repo = quote(repo_name, safe="")
 
     if dry_run:
-        emit(log, f"Would set GitHub default branch: {branch_name}")
+        if current_branch:
+            emit(log, f"Would set GitHub default branch: {branch_name} (current: {current_branch})")
+        else:
+            emit(log, f"Would set GitHub default branch: {branch_name}")
         return
 
     github_api(
@@ -1342,7 +1349,14 @@ def migrate_one(project, args, mirror_root, target_name, cache_name, repo_info, 
         emit(log, "GitHub repository already exists.")
         if args.skip_existing_push:
             emit(log, "Skipping mirror push because --skip-existing-push was provided.")
-            set_default_branch(args, target_name, project.get("default_branch"), args.dry_run, log=log)
+            set_default_branch(
+                args,
+                target_name,
+                project.get("default_branch"),
+                args.dry_run,
+                current_branch=repo_info.get("default_branch"),
+                log=log,
+            )
             return "default-branch-only"
     else:
         if args.dry_run:
@@ -1369,11 +1383,25 @@ def migrate_one(project, args, mirror_root, target_name, cache_name, repo_info, 
             emit(log, "Local cache already matches GitHub refs; skipping GitHub push.")
 
     if not push_needed and repo_info:
-        set_default_branch(args, target_name, project.get("default_branch"), args.dry_run, log=log)
+        set_default_branch(
+            args,
+            target_name,
+            project.get("default_branch"),
+            args.dry_run,
+            current_branch=repo_info.get("default_branch"),
+            log=log,
+        )
         return "skipped-unchanged"
 
     push_mirror(mirror_path, target_url, args, log=log)
-    set_default_branch(args, target_name, project.get("default_branch"), args.dry_run, log=log)
+    set_default_branch(
+        args,
+        target_name,
+        project.get("default_branch"),
+        args.dry_run,
+        current_branch=repo_info.get("default_branch") if repo_info else None,
+        log=log,
+    )
 
     if args.delete_mirror_after_push and mirror_path.exists():
         emit(log, f"Deleting local mirror: {mirror_path}")
@@ -1406,6 +1434,8 @@ def migrate_worker(project, target_name, cache_name, args, mirror_root, log=None
 
 def main():
     args = parse_args()
+    args.gitlab_url = os.environ.get("GITLAB_URL")
+    args.gitlab_token = os.environ.get("GITLAB_TOKEN")
 
     if not shutil.which("git"):
         print("git was not found in PATH.", file=sys.stderr)
