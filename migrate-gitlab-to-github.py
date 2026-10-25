@@ -288,8 +288,9 @@ def is_retryable_git_command(cmd):
 
 def mask_sensitive_text(value):
     text = str(value)
-    text = re.sub(r"https://x-access-token:[^@\s'\"]+@", "https://x-access-token:***@", text)
+    text = re.sub(r"(https?://)[^/@\s'\"]+:[^@\s'\"]+@", r"\1***@", text)
     text = re.sub(r"github_pat_[A-Za-z0-9_]+", "github_pat_***", text)
+    text = re.sub(r"gh[pousr]_[A-Za-z0-9_]{20,}", "gh*_***", text)
     text = re.sub(r"glpat-[A-Za-z0-9_-]+", "glpat-***", text)
     return text
 
@@ -325,7 +326,7 @@ def run(cmd, cwd=None, env=None, log=None, retries=0, retry_delay_seconds=10, in
                 input=input_text,
             )
             if result.stdout:
-                log.extend(result.stdout.rstrip().splitlines())
+                log.extend(mask_sensitive_text(result.stdout).rstrip().splitlines())
             if result.returncode == 0:
                 emit(log, "Command completed.")
                 return
@@ -1557,13 +1558,25 @@ def main():
         first_error = first_failure.get("error") or "unknown error"
         print(f"First failure: {first_error}", flush=True)
         log_tail = first_failure.get("log_tail") or []
+        detail_markers = (
+            "remote:",
+            "fatal:",
+            "error:",
+            "[remote rejected]",
+            "refusing",
+            "denied",
+            "unable to access",
+            "authentication failed",
+        )
         detail_lines = [
-            line
+            line.strip()
             for line in log_tail
-            if any(marker in line.lower() for marker in ("remote:", "fatal:", "error:"))
+            if any(marker in line.lower() for marker in detail_markers)
         ]
         if detail_lines:
-            print(f"First failure detail: {mask_sensitive_text(detail_lines[-1])}", flush=True)
+            print("First failure detail:", flush=True)
+            for line in detail_lines[-8:]:
+                print(f"  {mask_sensitive_text(line)}", flush=True)
         print(f"Failure record: {failed_record_path}", flush=True)
 
     return 1 if counts["failed"] else 0
