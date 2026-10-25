@@ -973,6 +973,9 @@ def ls_remote_refs(source_url, args, log=None):
 
 
 def unsafe_windows_ref_reason(refname):
+    if os.name != "nt":
+        return ""
+
     if refname.startswith("refs/tags/") and any(ord(char) > 127 for char in refname):
         return "tag contains non-ASCII characters that break packed-refs in this Windows Git environment"
 
