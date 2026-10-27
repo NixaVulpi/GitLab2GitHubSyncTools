@@ -1381,7 +1381,18 @@ def migrate_one(project, args, mirror_root, target_name, cache_name, repo_info, 
         emit(log, "Created private GitHub repository.")
 
     if repo_info and not args.dry_run:
-        github_state = remote_github_ref_state(args, target_name, log=log)
+        if repo_is_empty(repo_info):
+            github_state = {}
+            emit(log, "GitHub repository is empty; pushing initial refs.")
+        else:
+            try:
+                github_state = remote_github_ref_state(args, target_name, log=log)
+            except RuntimeError as exc:
+                if "Git Repository is empty" in str(exc):
+                    github_state = {}
+                    emit(log, "GitHub reported an empty repository; pushing initial refs.")
+                else:
+                    raise
         if states_match(local_state, github_state):
             push_needed = False
             emit(log, "Local cache already matches GitHub refs; skipping GitHub push.")
